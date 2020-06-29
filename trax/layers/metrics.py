@@ -14,28 +14,40 @@
 # limitations under the License.
 
 # Lint as: python3
-"""Trax metrics layers.
+"""Trax layers for computing metrics (loss functions and evaluation metrics).
 
-Trax computes metrics (loss functions and evaluation metrics) using layers.
-A metrics layer takes 2 or 3 batch inputs:
+A metric layer takes three inputs:
 
-  - output values (vectors)
-  - target values (vectors or scalars)
-  - weights [optional]
+  - model output: Batch of predicted values (typically vectors).
+  - targets: Batch of target values (e.g., categories or vectors).
+  - weights: Tensor that can assign different weights to different positions in.
+    the model output. One common use of weights is for masking -- assigning
+    weight 0 to positions that correspond to padding in the input so that they
+    don't affect metrics.
 
-and gives a single scalar as output. Trax reduces batch values to a scalar by
-taking the weighted (and often also masked) mean of those values:
+and returns a single (per-batch) scalar.
 
-  - `L2Loss`: weighted masked mean of L2 of (prediction_vector - target_vector)
+The `L2Loss` layer treats a batch as an unanalyzed tensor and computes an
+elementwise-weighted loss (Frobenius norm).
 
-  - `AccuracyScalar`: weighted masked mean of category predictions
-    (argmax(prediction_vector) vs. target_category)
+Other metric layers take into account the items that make up a batch. For each
+item in a batch, a raw metric value is computed by comparing (item-wise) the
+model output to the target value. These item-wise values are then combined into
+a single scalar for the batch by a weighted reduction function, typically
+weighted mean. For example:
 
-  - `CrossEntropyLoss`: weighted masked mean of pairwise cross entropy of
-    (prediction_vector, target_vector)
+  - Accuracy: Treat model output as giving different strength/votes to the
+    possible categories; measure the category prediction as correct (value 1)
+    if `argmax(output) == target_category`, else as incorrect (value 0). The
+    accuracy for the batch is then the weighted mean of these 1's and 0's.
 
+  - Cross Entropy: Treat model output and target values as two probability
+    distributions; measure the cross entropy of the model output relative to
+    the (assumed true) target distribution. The scalar value for the batch is
+    then the weighted mean of the item-wise cross-entropy values.
 
-TODO(jonni): Explain masks and weighting.
+In deriving a single scalar for the batch, there is flexibility to use reducing
+functions other than mean, for instance sum or a specialized sequence mean.
 """
 
 import jax
@@ -48,39 +60,49 @@ from trax.layers import core
 from trax.layers.base import Fn
 
 
+# TODO(jonni): Consider renaming to FrobeniusLoss.
 def L2Loss():
-  def f(y_hat, y, mask):  # pylint: disable=invalid-name
-    shapes.assert_same_shape(y_hat, y)
-    shapes.assert_same_shape(y, mask)
-    l2 = mask * (y_hat - y)**2
-    return jnp.sum(l2) / jnp.sum(mask)
+  """Returns a layer that computes total L2 loss for one batch."""
+  def f(model_output, targets, weights):  # pylint: disable=invalid-name
+    """Returns elementwise-weighted Frobenius norm of `model_output - targets`.
+
+    Args:
+      model_output: Output from one batch, treated as an unanalyzed tensor.
+      targets: Tensor of same shape as `model_output` containing element-wise
+          target values.
+      weights: Tensor of same shape as `model_output` and `targets`.
+    """
+    shapes.assert_same_shape(model_output, targets)
+    shapes.assert_same_shape(targets, weights)
+    l2 = weights * (model_output - targets)**2
+    return jnp.sum(l2) / jnp.sum(weights)
   return Fn('L2Loss', f)
 
 
 def AccuracyScalar():
-  """Computes weighted masked mean of category prediction accuracy."""
-  return _WeightedMaskedMean(_Accuracy())
+  """Returns a layer that computes mean category prediction accuracy."""
+  return _WeightedMeanOf(_Accuracy())
 
 
 def SequenceAccuracyScalar():
-  """Computes weighted masked mean of sequence prediction accuracy."""
-  return _WeightedMaskedMean(_Accuracy(),
-                             final_layer_override=_WeightedSequenceMean())
+  """Returns a layer that computes mean sequence prediction accuracy."""
+  return _WeightedMeanOf(_Accuracy(),
+                         final_layer_override=_WeightedSequenceMean())
 
 
 def CrossEntropyLoss():
-  """Computes weighted masked mean of prediction-target cross entropies."""
-  return _WeightedMaskedMean(_CrossEntropy())
+  """Returns a layer that computes mean prediction-target cross entropy."""
+  return _WeightedMeanOf(_CrossEntropy())
 
 
 def CrossEntropySum():
-  """Computes weighted masked sum of prediction-target cross entropies."""
-  return _WeightedMaskedMean(_CrossEntropy(),
-                             final_layer_override=WeightedSum())
+  """Returns a layer that computes sum of prediction-target cross entropies."""
+  return _WeightedMeanOf(_CrossEntropy(),
+                         final_layer_override=WeightedSum())
 
 
 def SumOfWeights():
-  """Returns a layer to compute sum of weights of all non-masked elements."""
+  """Returns a layer that computes sum of weights."""
   return cb.Serial(
       cb.Drop(),  # Drop inputs.
       cb.Drop(),  # Drop targets.
@@ -90,9 +112,9 @@ def SumOfWeights():
 
 
 def _Accuracy(axis=-1):
-  """Returns a layer to score matches of predicted versus target categories."""
-  def f(y_hat, target_category):  # pylint: disable=invalid-name
-    predicted_category = jnp.argmax(y_hat, axis=axis)
+  """Returns a layer that scores predicted versus target category."""
+  def f(model_output, target_category):  # pylint: disable=invalid-name
+    predicted_category = jnp.argmax(model_output, axis=axis)
     # TODO(pkozakowski): This assertion breaks some tests. Fix and uncomment.
     # shapes.assert_same_shape(predicted_category, target_category)
     return jnp.equal(predicted_category, target_category).astype(jnp.float32)
@@ -100,12 +122,12 @@ def _Accuracy(axis=-1):
 
 
 def _CrossEntropy():
-  """Returns a layer to compute prediction-target cross entropies."""
-  def f(y_hat, target_category):  # pylint: disable=invalid-name
+  """Returns a layer that computes prediction-target cross entropies."""
+  def f(model_output, target_category):  # pylint: disable=invalid-name
     # TODO(pkozakowski): This assertion breaks some tests. Fix and uncomment.
-    # shapes.assert_shape_equals(target_category, y_hat.shape[:-1])
-    return -1.0 * jnp.sum(y_hat * one_hot(target_category, y_hat.shape[-1]),
-                          axis=-1)
+    # shapes.assert_shape_equals(target_category, model_output.shape[:-1])
+    target_distribution = one_hot(target_category, model_output.shape[-1])
+    return -1.0 * jnp.sum(model_output * target_distribution, axis=-1)
   return Fn('_CrossEntropy', f)
 
 
@@ -140,11 +162,27 @@ def _WeightedSequenceMean():
 
 
 # pylint: disable=no-value-for-parameter
-def _WeightedMaskedMean(metric_layer, final_layer_override=None):
-  """Computes weighted masked mean of metric_layer(predictions, targets)."""
+# TODO(jonni): Consider redesign where _WeightedMean is the default reducer.
+def _WeightedMeanOf(raw_metric, final_layer_override=None):
+  """Wraps a metric computation with a weighted mean or other reducing function.
+
+  This layer depends on externally provided weights that match (or can be
+  broadcasted to match) the output of the `raw_metric` layer.
+
+  Args:
+    raw_metric: Layer with two inputs -- predictions and targets -- that
+        computes the raw logic of a metric prior to batch-level weighting or
+        pooling.
+    final_layer_override: Layer that reduces raw metric output to a single
+        scalar, in place of the default weighted mean.
+
+  Returns:
+    A layer that computes a single scalar by combining values from the given
+    raw metric function.
+  """
   final_layer = final_layer_override or _WeightedMean()  # For sequence acc.
   return cb.Serial(
-      metric_layer,
+      raw_metric,
       final_layer
   )
 # pylint: enable=no-value-for-parameter
